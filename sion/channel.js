@@ -50,7 +50,7 @@ class StateVariableFilter {
   get feedback() { return this._feedback }
   set feedback(v) {
     this._feedback = v
-    this._fb = 1 / ((v < 1/512) ? 1 : v * 512)  // 0~1 => 1~1/512
+    this._fb = Math.pow(512, -v)  // 0~1 => 1~1/512 (Q=1~512), exponential
   }
 
   apply(source) {
@@ -228,6 +228,7 @@ class Oscillator {
     this._pitch = 0
     this._phase = 0
     this._phaseDelta = this.rom.phaseDelta["default"]
+    this._phaseDeltaNoise = this.rom.phaseDelta["sample440"]
     this.resetConnection()
   }
 
@@ -266,7 +267,10 @@ class Oscillator {
 
       this._pitch = pitch + this.voice._coarse.value + this.voice._fine.value + pmod
       const pitchIndex = clamp(this._pitch * 64, 0, 8191) >> 0
-      const phaseDelta = this._phaseDelta[pitchIndex] * multiple
+      // Noise steps through its table at 'sample440' speed (1 entry/sample at A4) instead of cycles/sample.
+      const phaseDelta = (this.voice.waveform.type === 4)
+        ? this._phaseDeltaNoise[pitchIndex] * multiple / wave.length
+        : this._phaseDelta[pitchIndex] * multiple
 
       for (let i = 0; i < imax; i++) {
         const phaseFM = this._phase + this.mod[i] * fmgain
@@ -287,7 +291,7 @@ class WaveGenerator {
   constructor(rom, generatorID) {
     this.rom = rom
     this._generatorID = generatorID
-    this.voice = new Voice("generator#" + generatorID, false)
+    this.voice = Voice.detached("generator#" + generatorID)
 
     this.osc = [
       new Oscillator(0, rom, this.voice.oscillators[0]), 
@@ -328,9 +332,9 @@ class WaveGenerator {
   noteon(noteonID, data, voiceBuffer) {
     this._noteonID = noteonID
     this.notenumber = data.notenumber
-    this.velocity = data.velocity
+    this.velocity = data.velocity / 127
 
-    this.voice.buffer = voiceBuffer
+    this.voice.attach(voiceBuffer)
     this._updateOscConnections()
 
     this.pitch_eg.keyon()
@@ -392,8 +396,12 @@ class WaveGenerator {
     const fmod = lfoOutputs[this.voice.filterEnvelope._lfoIndex.value] * this.voice.filterEnvelope.lfoDepth()
     const pitchShift = this.pitch_eg.stepByFrame() + parameters.pitch[0]
 
-    this.filter.type = this.voice.filterEnvelope._filterType.value
-    this.filter.cutoff = clamp(this.filter_eg.stepByFrame() + parameters.cutoff[0] + fmod, 0, 1)
+    // UI filter type: 0=Direct, 1=LPF, 2=BPF, 3=HPF -> StateVariableFilter.Type is LOW/BAND/HIGH (1 less); Direct bypasses.
+    const filterType = this.voice.filterEnvelope._filterType.value
+    if (filterType > 0) this.filter.type = filterType - 1
+    // filter envelope runs 0..1; peakLevel (UI CUT) scales the whole cutoff.
+    const cutoffScale = this.voice.filterEnvelope._peakLevel.value
+    this.filter.cutoff = clamp(this.filter_eg.stepByFrame() * cutoffScale + parameters.cutoff[0] + fmod, 0, 1)
     this.filter.feedback = clamp(this.voice.filterEnvelope._resonance.value + parameters.resonance[0], 0, 1)
 
     const outputLevel = parameters.volume[0] * parameters.expression[0] * this.velocity
@@ -403,12 +411,12 @@ class WaveGenerator {
     
     for (let dst_i = 0; dst_i < dst_imax; ) {
       for (let osc_i = this.osc.length - 1; osc_i >= 0 ; --osc_i) {
-        const oscVoice = this.voice.osc[osc_i]
+        const oscVoice = this.voice.oscillators[osc_i]
         const amod = lfoOutputs[oscVoice._lfoIndex.value] * oscVoice.lfoDepth()
         this.osc[osc_i].generate(this.notenumber + pitchShift, amod, pmod)
       }
-      const filterOut = (this._filterOutOsc == -1) ? 
-        ROM._instance.zero : this.filter.apply(this.osc[this._filterOutOsc].out)
+      const filterOut = (this._filterOutOsc == -1) ? ROM._instance.zero :
+        (filterType === 0) ? this.osc[this._filterOutOsc].out : this.filter.apply(this.osc[this._filterOutOsc].out)
       const directOut = (this._directOutOsc == -1) ? 
         ROM._instance.zero : this.osc[this._directOutOsc].out
 
@@ -435,41 +443,36 @@ class WaveGenerator {
     this.osc[2].resetConnection()
     this.osc[3].resetConnection()
 
-    // voice not alived
-    if (!this.voice.isAlive) {
-      this._oscConnectionFlags = -1
-      return
-    }
-
     // connect
     const con = this.voice.connect
     this._oscConnectionFlags = con.flags
 
-    let lastFilterOut, lastDirectOut, lastCarrier, flags
+    let firstFilterOut = -1, lastFilterOut = -1
+    let firstDirectOut = -1, lastDirectOut = -1
+    let flags
 
+    // 高インデックスが先に生成されるため、低インデックス側の in に高インデックスの out を連鎖させる
     flags = con.oscout
-    for (let i=0, lastFilterOut=-1, lastDirectOut=-1; i<this.osc.length; i++) {
+    for (let i=0; i<this.osc.length; i++) {
       if (flags[i]) {
         if (this.voice.oscillators[i]._applyFilter.value) {
-          if (lastFilterOut == -1) lastFilterOut = 0
-          this.osc[lastFilterOut].in = this.osc[i].out
-          this.osc[i].isConnectToOut = true
-          this.osc[i].isActive = true
+          if (lastFilterOut == -1) firstFilterOut = i
+          else this.osc[lastFilterOut].in = this.osc[i].out
           lastFilterOut = i
         } else {
-          if (lastDirectOut == -1) lastDirectOut = 0
-          this.osc[lastDirectOut].in = this.osc[i].out
-          this.osc[i].isConnectToOut = true
-          this.osc[i].isActive = true
+          if (lastDirectOut == -1) firstDirectOut = i
+          else this.osc[lastDirectOut].in = this.osc[i].out
           lastDirectOut = i
         }
+        this.osc[i].isConnectToOut = true
+        this.osc[i].isActive = true
       }
     }
-    this._filterOutOsc = lastFilterOut
-    this._directOutOsc = lastDirectOut
+    this._filterOutOsc = firstFilterOut
+    this._directOutOsc = firstDirectOut
 
     flags = con.oscmod1
-    for (i=1, lastCarrier=0; i<this.osc.length; i++) {
+    for (let i=1, lastCarrier=0; i<this.osc.length; i++) {
       if (flags[i]) {
         this.osc[lastCarrier].mod = this.osc[i].out
         this.osc[lastCarrier].isCarrier = true
@@ -479,7 +482,7 @@ class WaveGenerator {
     }
 
     flags = con.oscmod2
-    for (i=2, lastCarrier=1; i<this.osc.length; i++) {
+    for (let i=2, lastCarrier=1; i<this.osc.length; i++) {
       if (flags[i]) {
         this.osc[lastCarrier].mod = this.osc[i].out
         this.osc[lastCarrier].isCarrier = true
@@ -503,12 +506,12 @@ class Channel extends AudioWorkletProcessor {
     this.rom = ROM.singleton(option.processorOptions.sampleRate)
     this._generators = []
     this._generatorCount = 0
-    this._voice = new Voice("default", true)
+    this._voice = new Voice("default")
     this._noteVoiceBuffers = []
     this.port.onmessage = e => this.onMessage(e)
 
     this._noteonIDCounter = 0
-    this.generatorCount = option.generatorCount || 3
+    this.generatorCount = option.processorOptions.generatorCount || 3
 
     this.events = Channel.getEventHandlers(this)
   }
@@ -527,9 +530,9 @@ class Channel extends AudioWorkletProcessor {
       {name: 'resonance', defaultValue: 0, minValue: -1, maxValue: 1},
 
       {name: 'dry', defaultValue: 1.0, minValue: 0, maxValue: 1},
-      {name: 'effect1', defaultValue: 0.25, minValue: 0, maxValue: 1},
-      {name: 'effect2', defaultValue: 0.0, minValue: 0, maxValue: 1},
-      {name: 'effect3', defaultValue: 0.0, minValue: 0, maxValue: 1},
+      {name: 'effectSend1', defaultValue: 0.25, minValue: 0, maxValue: 1},
+      {name: 'effectSend2', defaultValue: 0.0, minValue: 0, maxValue: 1},
+      {name: 'effectSend3', defaultValue: 0.0, minValue: 0, maxValue: 1},
     ]
   }
 
@@ -597,7 +600,7 @@ class Channel extends AudioWorkletProcessor {
 
 
   process(inputs, outputs, parameters) {
-    const sendlevels = [parameters.dry[0], parameters.effect1[0], parameters.effect2[0], parameters.effect3[0]]
+    const sendlevels = [parameters.dry[0], parameters.effectSend1[0], parameters.effectSend2[0], parameters.effectSend3[0]]
     const src = outputs[0]
     const sampleCount = src[0].length
 

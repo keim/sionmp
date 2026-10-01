@@ -1,5 +1,5 @@
 export class Voice {
-  constructor(name, allocate = true, onUpdate = null) {
+  constructor(name, onUpdate = null) {
     this.id = Voice._incremental_id++
     this.name = name
 
@@ -22,14 +22,28 @@ export class Voice {
     this.pitchEnvelope = new Voice.PitchEnvelope(this)
     this.filterEnvelope = new Voice.FilterEnvelope(this)
 
-    if (allocate) {
-      this.buffer = new Uint8Array(Voice.Parameter._incremental_index)
-      this.initialize()
-    } else {
-      this.buffer = null
-    }
+    this._bufferSize = Voice.Parameter._incremental_index
+    this._buffer = new Uint8Array(this._bufferSize)
+    this.initialize()
 
     this._onUpdate = onUpdate
+  }
+
+  // Worklet-only (WaveGenerator): a Voice that borrows a buffer per note via attach(). Not declared in voice.d.ts.
+  static detached(name) {
+    const voice = new Voice(name)
+    voice._buffer = null
+    return voice
+  }
+
+  get buffer() {
+    if (!this._buffer) throw new Error(`Voice "${this.name}" is detached; call attach() first`)
+    return this._buffer
+  }
+
+  attach(buffer) {
+    if (buffer.length !== this._bufferSize) throw new Error(`Voice buffer size mismatch: ${buffer.length} != ${this._bufferSize}`)
+    this._buffer = buffer
   }
 
   get formatType() {
@@ -55,10 +69,6 @@ export class Voice {
 
   _updateParam(bufferIndex, data) {
     this.buffer[bufferIndex] = data & 127
-  }
-
-  get isAlive() {
-    return !!this.buffer
   }
 }
 Voice._incremental_id = 0
@@ -320,66 +330,55 @@ Voice.Waveform = class {
   constructor(voice) {
     this._wavelet = new Float32Array(Voice.Waveform.SAMPLE_COUNT)
     this._wavelet.fill(0)
-    this._type = 0
-    this._pwm = 4
-    this._deflate = 0
     this._tableIndex = new Voice.Parameter(voice, 0, 127, 0)
     this._flag = new Voice.Parameter(voice, 0, 127, 0)
     this._windowMultiple = new Voice.Pack(this._flag, 0, 0x7)
     this._windowModulation = new Voice.Pack(this._flag, 3, 0x3)
-    this._updated = true
+    this._cacheKey = -1
   }
 
   initialize() {
-    this._type = 0
-    this._pwm = 4
-    this._deflate = 0
+    this._tableIndex.uint7 = Voice.Waveform._calcTableIndex(0, 4, 0)
     this._windowMultiple.value = 0
     this._windowModulation.value = 0
-    this._updated = true
   }
 
-  get type() { return this._type }
+  // type/pwm/deflate live in the buffer (tableIndex) so that both threads see the same shape.
+  get type() { const i = this._tableIndex.uint7; return i >= Voice.Waveform.TABLE_INDEX_MAX ? 4 : i & 3 }
   set type(t) {
-    this._type = (t < 0) ? 0 : (t > 4) ? 4 : t
-    this._updated = true
+    this._tableIndex.uint7 = Voice.Waveform._calcTableIndex((t < 0) ? 0 : (t > 4) ? 4 : t, this.pwm, this.deflate)
   }
 
-  get pwm() { return this._pwm }
+  get pwm() { const i = this._tableIndex.uint7; return i >= Voice.Waveform.TABLE_INDEX_MAX ? 4 : (i >> 2) % 9 }
   set pwm(p) {
-    this._pwm = (p < 0) ? 0 : (p > 8) ? 8 : p
-    this._updated = true
+    this._tableIndex.uint7 = Voice.Waveform._calcTableIndex(this.type, (p < 0) ? 0 : (p > 8) ? 8 : p, this.deflate)
   }
 
-  get deflate() { return this._deflate }
+  get deflate() { const i = this._tableIndex.uint7; return i >= Voice.Waveform.TABLE_INDEX_MAX ? 0 : ((i >> 2) / 9) | 0 }
   set deflate(d) {
-    this._deflate = (d < 0) ? 0 : (d > 2) ? 2 : d
-    this._updated = true
+    this._tableIndex.uint7 = Voice.Waveform._calcTableIndex(this.type, this.pwm, (d < 0) ? 0 : (d > 2) ? 2 : d)
   }
 
   get windowMultiple() { return this._windowMultiple.value }
-  set windowMultiple(v) {
-    this._windowMultiple.value = v
-    this._updated = true
-  }
+  set windowMultiple(v) { this._windowMultiple.value = v }
 
   get windowModulation() { return this._windowModulation.value }
-  set windowModulation(v) {
-    this._windowModulation.value = v
-    this._updated = true
-  }
+  set windowModulation(v) { this._windowModulation.value = v }
 
   get wavelet() {
-    if (this._updated) {
-      this._tableIndex.value = Voice.Waveform._calcTableIndex(this._type, this._pwm, this._deflate)
-      const basewave = Voice.Waveform._getBasicWavelet(this._tableIndex.value)
+    const tableIndex = Math.min(this._tableIndex.uint7, Voice.Waveform.TABLE_INDEX_MAX)
+    // The noise table is returned as-is (no window modulation, not copied to _wavelet).
+    if (tableIndex > 107) return Voice.Waveform._getBasicWavelet(tableIndex)
+    const key = tableIndex | (this._flag.uint7 << 8)
+    if (key !== this._cacheKey) {
+      const basewave = Voice.Waveform._getBasicWavelet(tableIndex)
       const sampleCount = Voice.Waveform.SAMPLE_COUNT
       const dp = 2 / sampleCount * (this._windowMultiple.value + 1)
       const k = [0, 0.5, 1, 2][this._windowModulation.value]
       for (let i=0, p=0; i < sampleCount; i++, p+=dp) {
         this._wavelet[i] = basewave[i] * (1 - (p & 1) * k)
       }
-      this._updated = false
+      this._cacheKey = key
     }
     return this._wavelet
   }
@@ -449,13 +448,14 @@ Voice.Waveform = class {
         }
       // 108(type=4): 16bit LFSR
       const a = new Float32Array(65536)
-      for (let i=0, s=12345; i<65536; i++) a[i] = (s = (s>>1) | (((s<<10)^(s<<12)^(s<<13)^(s<<15)) & 0x8000))
+      for (let i=0, s=12345; i<65536; i++) a[i] = (s = (s>>1) | (((s<<10)^(s<<12)^(s<<13)^(s<<15)) & 0x8000)) / 32768 - 1
       Voice.Waveform._wavetables.push(a)
     }
     return Voice.Waveform._wavetables[tableIndex]
   }
 }
 Voice.Waveform.SAMPLE_COUNT = 1024
+Voice.Waveform.TABLE_INDEX_MAX = 108 // noise; larger indices are reserved and clamped to this
 Voice.Waveform.WAVE_TYPE = {
   SINE: 0,
   SAW: 1,
@@ -615,7 +615,7 @@ Voice.FilterEnvelope = class {
         } else {
           this.sampleCount = this._attackTime.value * frameRate
           this.level = 0
-          this.addition = this._peakLevel.value / this.sampleCount
+          this.addition = 1 / this.sampleCount
         }
         break
       case Voice.EnvelopeState.DECAY:
@@ -628,10 +628,8 @@ Voice.FilterEnvelope = class {
         } else {
           this.sampleCount =
             this._decayTime.uint7 == 0 ? 1 : this._decayTime.value * frameRate
-          this.level = this._peakLevel.value
-          this.addition =
-            (this._sustainLevel.value - this._peakLevel.value) /
-            this.sampleCount
+          this.level = 1
+          this.addition = (this._sustainLevel.value - 1) / this.sampleCount
         }
         break
       case Voice.EnvelopeState.SUSTAIN:
@@ -705,7 +703,7 @@ Voice.OscillatorEnvelope = class {
         break
       case Voice.EnvelopeState.RELEASE:
         this.sampleCount = 0
-        this.attenuation = Math.pow(10, this._releaseRate.value / (20 * sampleRate))
+        this.attenuation = Math.pow(10, -this._releaseRate.value / (20 * sampleRate))
         this.addition = 0
         break
       default:
