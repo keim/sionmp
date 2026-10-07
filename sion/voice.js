@@ -83,6 +83,13 @@ Voice.UNISON_TYPE = {
   DUAL_5TH: 2,
   DUAL_OCTAVE: 3,
 }
+Voice.AmpLFOTable =
+  [0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75, 0.8125, 0.875, 1]
+Voice.PitchLFOTable =
+  [0, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 7, 9, 12]
+Voice.FilterLFOTable =
+  [0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75, 0.8125, 0.875, 1]
+
 
 //---- base classes of all parameters
 Voice.Parameter = class {
@@ -99,12 +106,18 @@ Voice.Parameter = class {
         Voice.Parameter._hash[key] = new Float32Array(128).map(
           (_, i) => ((max - min) * i) / 127 + min
         )
-      } else {
+      } else if (logBase == 2) {
         const t = new Float32Array(128).map((_, i) =>
-          Math.pow(logBase, ((max - min) * i) / 128 + min)
+          Math.pow(2, ((max - min) * i) / 128 + min)
         )
-        t[127] = Math.pow(logBase, max)
+        t[127] = Math.pow(2, max)
         if (allowZero) t[0] = 0
+        Voice.Parameter._hash[key] = t
+      } else if (logBase == 3) {
+        const t = new Float32Array(128).map((_, i) =>
+          i == 64 ? 0 : i < 64 ? - Math.pow(2, max * (64 - i) / 64) : Math.pow(2, max * (i - 64) / 64)
+        )
+        t[127] = Math.pow(2, max)
         Voice.Parameter._hash[key] = t
       }
     }
@@ -484,19 +497,16 @@ Voice.PitchEnvelope = class {
   constructor(voice) {
     this._attackTime = new Voice.Parameter(voice, -11, 5, 2, true)
     this._decayTime = new Voice.Parameter(voice, -11, 5, 2, true)
-    this._sustainSlope = new Voice.Parameter(voice, -32, 31.5, 1)
-    this._releaseSlope = new Voice.Parameter(voice, -32, 31.5, 1)
+    this._sustainSlope = new Voice.Parameter(voice, 0, 8, 3)
+    this._releaseSlope = new Voice.Parameter(voice, 0, 8, 3)
     this._startPitch = new Voice.Parameter(voice, -32, 31.5, 1)
     this._overShoot = new Voice.Parameter(voice, 0, 1, 1)
     this._lfoFlgs = new Voice.Parameter(voice, 0, 127, 0)
     this._lfoIndex = new Voice.Pack(this._lfoFlgs, 0, 0x03)
     this._lfoDepth = new Voice.Pack(this._lfoFlgs, 2, 0x0f)
+    this._lfoSign = new Voice.Pack(this._lfoFlgs, 6, 0x01)
     this.totalLevel = 1
     this.attenuation = 1
-  }
-
-  lfoDepth() {
-    return Voice.PitchEnvelope.LFO_TABLE[this._lfoDepth.value]
   }
 
   initialize() {
@@ -508,6 +518,7 @@ Voice.PitchEnvelope = class {
     this._overShoot.value = 0
     this._lfoIndex.value = 0
     this._lfoDepth.value = 0
+    this._lfoSign.value = 0
     this.setState(Voice.EnvelopeState.OFF, 48000, 128)
   }
 
@@ -523,9 +534,7 @@ Voice.PitchEnvelope = class {
           )
         } else {
           this.sampleCount =
-            this._attackTime.uint7 == 0
-              ? 1
-              : this._attackTime.value * frameRate
+            Math.ceil(this._attackTime.value * frameRate)
           this.level = this._startPitch.value
           this.addition =
             (this._overShoot.value - this._startPitch.value) / this.sampleCount
@@ -540,7 +549,7 @@ Voice.PitchEnvelope = class {
           )
         } else {
           this.sampleCount =
-            this._decayTime.uint7 == 0 ? 1 : this._decayTime.value * frameRate
+            Math.ceil(this._decayTime.value * frameRate)
           this.level = this._overShoot.value
           this.addition = -this._overShoot.value / this.sampleCount
         }
@@ -562,8 +571,6 @@ Voice.PitchEnvelope = class {
     return state
   }
 }
-Voice.PitchEnvelope.LFO_TABLE =
-  [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 1, 0, -0.125, -0.25, -0.375, -0.5, -0.625, -0.75, -1]
 
 
 Voice.FilterEnvelope = class {
@@ -580,6 +587,7 @@ Voice.FilterEnvelope = class {
     this._lfoFlgs = new Voice.Parameter(voice, 0, 127, 0)
     this._lfoIndex = new Voice.Pack(this._lfoFlgs, 0, 0x03)
     this._lfoDepth = new Voice.Pack(this._lfoFlgs, 2, 0x0f)
+    this._lfoSign = new Voice.Pack(this._lfoFlgs, 6, 0x01)
     this.totalLevel = 1
     this.attenuation = 1
   }
@@ -595,11 +603,8 @@ Voice.FilterEnvelope = class {
     this._resonance.value = 0
     this._lfoIndex.value = 0
     this._lfoDepth.value = 0
+    this._lfoSign.value = 0
     this.setState(Voice.EnvelopeState.OFF, 48000, 128)
-  }
-
-  lfoDepth() {
-    return Voice.FilterEnvelope.LFO_TABLE[this._lfoDepth.value]
   }
 
   setState(state, sampleRate, samplePerFrame) {
@@ -649,8 +654,6 @@ Voice.FilterEnvelope = class {
     return state
   }
 }
-Voice.FilterEnvelope.LFO_TABLE = 
-  [0, 0.125, 0.25, 0.5, 1, 2, 4, 12, 0, -0.125, -0.25, -0.5, -1, -2, -4, -12]
 
 
 Voice.OscillatorEnvelope = class {
@@ -739,10 +742,7 @@ Voice.Oscillator = class {
     this._lfoFlgs = new Voice.Parameter(voice, 0, 127, 0)
     this._lfoIndex = new Voice.Pack(this._lfoFlgs, 0, 0x03)
     this._lfoDepth = new Voice.Pack(this._lfoFlgs, 2, 0x0f)
-  }
-
-  lfoDepth() {
-    return Voice.Oscillator.LFO_TABLE[this._lfoDepth.value]
+    this._lfoSign = new Voice.Pack(this._lfoFlgs, 6, 0x01)
   }
 
   initialize() {
@@ -756,7 +756,6 @@ Voice.Oscillator = class {
     this._feedback.value = 0
     this._lfoIndex.value = 0
     this._lfoDepth.value = 0
+    this._lfoSign.value = 0
   }
 }
-Voice.Oscillator.LFO_TABLE = 
-  [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 1, 0, -0.125, -0.25, -0.375, -0.5, -0.625, -0.75, -1]

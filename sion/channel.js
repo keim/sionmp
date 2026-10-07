@@ -79,6 +79,7 @@ class LowFreqOscillator {
   }
 
   reset() {
+    this._isNoizeTable = false
     this._wavelet = Voice.Waveform._getBasicWavelet(16)
     this._frameCounter = 0
     this._envLevel = 0
@@ -91,6 +92,7 @@ class LowFreqOscillator {
     this.changeState(EnvelopeGenerator.State.ATTACK)
     const tableIndex = Voice.Waveform._calcTableIndex(this.voice._waveShapeType.value, 4, 0)
     this._wavelet = Voice.Waveform._getBasicWavelet(tableIndex)
+    this._isNoizeTable = tableIndex > 107
   }
   
   keyoff() {
@@ -104,7 +106,7 @@ class LowFreqOscillator {
         this.changeState(EnvelopeGenerator.State.DECAY)
         return 
       } else {
-        this._frameCounter = this.voice._delay.value * frameRate
+        this._frameCounter = Math.ceil(this.voice._delay.value * frameRate)
         this._envLevel = 0
         this._addition = 0
       }
@@ -114,7 +116,7 @@ class LowFreqOscillator {
         this.changeState(EnvelopeGenerator.State.SUSTAIN)
         return 
       } else {
-        this._frameCounter = this.voice._time.value * frameRate
+        this._frameCounter = Math.ceil(this.voice._time.value * frameRate)
         this._envLevel = 0
         this._addition = 1 / this._frameCounter
         this._phase = 0
@@ -130,12 +132,14 @@ class LowFreqOscillator {
 
   stepByFrame(controlLevel, controlSpeed) {
     const frameRate = this.rom.sampleRate / this.rom.samplesPerFrame
+    const dphase = this.voice._frequency.value / frameRate * controlSpeed
+    const wave = this._wavelet
+
     this._envLevel = clamp(this._envLevel + this._addition, 0, 1)
-    this._phase += this.voice._frequency.value / frameRate * controlSpeed
+    this._phase += dphase * (this._isNoizeTable ? (1/wave.length) : 1)
     if (1 <= this._phase) this._phase -= 1
 
     if (--this._frameCounter == 0) this.changeState(this._state + 1)
-    const wave = this._wavelet
     const index = (wave.length * this._phase) & (wave.length - 1)
     return wave[index] * (this._envLevel + controlLevel)
   }
@@ -392,17 +396,21 @@ class WaveGenerator {
       this.lfo[1].stepByFrame(parameters.lfo[0], parameters.lfospeed[0]), 0, 0
     ]
     // calc modulation
-    const pmod = lfoOutputs[this.voice.pitchEnvelope._lfoIndex.value] * this.voice.pitchEnvelope.lfoDepth()
-    const fmod = lfoOutputs[this.voice.filterEnvelope._lfoIndex.value] * this.voice.filterEnvelope.lfoDepth()
+    const pitchenv = this.voice.pitchEnvelope
+    const pmod = lfoOutputs[pitchenv._lfoIndex.value]
+      * Voice.PitchLFOTable[pitchenv._lfoDepth.value] * (pitchenv._lfoSign.value ? -1 : 1)
     const pitchShift = this.pitch_eg.stepByFrame() + parameters.pitch[0]
 
     // UI filter type: 0=Direct, 1=LPF, 2=BPF, 3=HPF -> StateVariableFilter.Type is LOW/BAND/HIGH (1 less); Direct bypasses.
-    const filterType = this.voice.filterEnvelope._filterType.value
+    const filterenv = this.voice.filterEnvelope
+    const fmod = lfoOutputs[filterenv._lfoIndex.value]
+      * Voice.FilterLFOTable[filterenv._lfoDepth.value] * (filterenv._lfoSign.value ? -1 : 1)
+    const filterType = filterenv._filterType.value
     if (filterType > 0) this.filter.type = filterType - 1
     // filter envelope runs 0..1; peakLevel (UI CUT) scales the whole cutoff.
-    const cutoffScale = this.voice.filterEnvelope._peakLevel.value
+    const cutoffScale = filterenv._peakLevel.value
     this.filter.cutoff = clamp(this.filter_eg.stepByFrame() * cutoffScale + parameters.cutoff[0] + fmod, 0, 1)
-    this.filter.feedback = clamp(this.voice.filterEnvelope._resonance.value + parameters.resonance[0], 0, 1)
+    this.filter.feedback = clamp(filterenv._resonance.value + parameters.resonance[0], 0, 1)
 
     const outputLevel = parameters.volume[0] * parameters.expression[0] * this.velocity
     const panIndex = clamp((parameters.pan[0] + 1) * 128, 0, 255) >> 0
@@ -412,7 +420,8 @@ class WaveGenerator {
     for (let dst_i = 0; dst_i < dst_imax; ) {
       for (let osc_i = this.osc.length - 1; osc_i >= 0 ; --osc_i) {
         const oscVoice = this.voice.oscillators[osc_i]
-        const amod = lfoOutputs[oscVoice._lfoIndex.value] * oscVoice.lfoDepth()
+        const amod = lfoOutputs[oscVoice._lfoIndex.value]
+          * Voice.AmpLFOTable[oscVoice._lfoDepth.value] * (oscVoice._lfoSign.value ? -1 : 1)
         this.osc[osc_i].generate(this.notenumber + pitchShift, amod, pmod)
       }
       const filterOut = (this._filterOutOsc == -1) ? ROM._instance.zero :
@@ -565,6 +574,13 @@ class Channel extends AudioWorkletProcessor {
     
       _updateVoiceParam: data => {
         _this._voice._updateParam(data.index, data.value)
+      },
+
+      _updateVoiceBuffer: data => {
+        const dst = _this._voice.buffer
+        const src = data.buffer
+        if (src.length !== dst.length) throw new Error(`Voice buffer size mismatch: ${src.length} != ${dst.length}`)
+        dst.set(src)
       }
     }
   }
